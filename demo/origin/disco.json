@@ -1,0 +1,11 @@
+{
+    "version": "1.0",
+    "services": {
+        "web": { "port": 8081, "image": "demo" }
+    },
+    "images": {
+        "demo": {
+            "dockerfile": "demo/origin/Dockerfile"
+        }
+    }
+}

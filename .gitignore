@@ -1,0 +1,5 @@
+# issuer private key (default -key path)
+issuer-key.pem
+
+# vim swap files
+*.swp

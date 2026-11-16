@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Privacy Pass Token Wallet</title>
+</head>
+<body>
+    <script type="module">
+    const CDN = 'https://esm.sh/@cloudflare/privacypass-ts@0.9.0/lib/src/';
+    const { BLIND_RSA, BlindRSAMode, Client } = await import(CDN + 'pub_verif_token.js');
+    const { TokenChallenge } = await import(CDN + 'auth_scheme/private_token.js');
+
+    // Injected by the server: the issuer's URL and name, and its token key
+    // (base64 SPKI with the RSASSA-PSS OID, per RFC 9578).
+    const issuerURL = {{.IssuerURL}};
+    const issuerName = {{.IssuerName}};
+    const issuerPublicKey = Uint8Array.fromBase64({{.PublicKey}});
+
+    // How many tokens to ask for in each request to /token. The server allows
+    // up to 100.
+    const batchSize = 10;
+
+    // The wallet logs in to the issuer with a session ID, which it sends as a
+    // bearer token. It keeps the session in localStorage as the issuer gave
+    // it, {SessionID, Name}, so it can show who it's logged in as without
+    // asking the issuer. session returns it, or null when logged out.
+    const sessionKey = 'issuerSession';
+    const session = () => JSON.parse(localStorage.getItem(sessionKey));
+
+    // A login uses PKCE (RFC 7636): the wallet makes a random verifier, keeps
+    // it in sessionStorage, and sends the issuer its hash. Logging in ends
+    // with a redirect back here with a one-time login code in the fragment,
+    // which the issuer trades for a session ID only along with the verifier.
+    // So a login code works only in the tab that started the login.
+    const verifierKey = 'loginVerifier';
+
+    async function startLogin() {
+        // PKCE uses base64url without padding.
+        const encode = (bytes) => bytes.toBase64({ alphabet: 'base64url', omitPadding: true });
+        const verifier = encode(crypto.getRandomValues(new Uint8Array(32)));
+        sessionStorage.setItem(verifierKey, verifier);
+        const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+        location.href = `${issuerURL}/login?code_challenge=${encode(new Uint8Array(hash))}`;
+    }
+
+    // Finish a login: trade the code in the fragment for a session ID, and
+    // take the code out of the address bar.
+    const code = new URLSearchParams(location.hash.slice(1)).get('code');
+    if (code !== null) {
+        history.replaceState(null, '', location.pathname + location.search);
+        const verifier = sessionStorage.getItem(verifierKey);
+        sessionStorage.removeItem(verifierKey);
+        if (verifier === null) {
+            console.error('login failed: this tab did not start a login');
+        } else {
+            const resp = await fetch(issuerURL + '/session', {
+                method: 'POST',
+                body: new URLSearchParams({ code, code_verifier: verifier }),
+            });
+            if (resp.ok) {
+                localStorage.setItem(sessionKey, JSON.stringify(await resp.json()));
+            } else {
+                console.error(`login failed: ${resp.status} ${await resp.text()}`);
+            }
+        }
+    }
+
+    // fetchTokens gets n tokens for challenge from the issuer in one request:
+    // it creates n blinded token requests, has the server sign them all at
+    // /token, and unblinds each signature into a token. It returns null if
+    // the issuer doesn't accept sessionID (for example, because the session
+    // expired).
+    async function fetchTokens(challenge, issuerKey, n, sessionID) {
+        // A Client holds the blinding state for a single token, so each token
+        // gets its own.
+        const clients = Array.from({ length: n }, () => new Client(BlindRSAMode.PSS));
+        const tokReqs = await Promise.all(
+            clients.map((client) => client.createTokenRequest(challenge, issuerKey)));
+
+        const resp = await fetch(issuerURL + '/token', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${sessionID}` },
+            body: JSON.stringify(tokReqs.map((tokReq) => ({
+                BlindedReq: tokReq.blindedMsg.toBase64(),
+                TokenKeyId: tokReq.truncatedTokenKeyId,
+            }))),
+        });
+        if (resp.status === 401) {
+            return null;
+        }
+        if (!resp.ok) {
+            throw new Error(`token request failed: ${resp.status} ${await resp.text()}`);
+        }
+        const sigs = (await resp.json()).BlindSignatures;
+        if (sigs.length !== n) {
+            throw new Error(`asked for ${n} tokens, got ${sigs.length}`);
+        }
+        return Promise.all(clients.map((client, i) =>
+            client.finalize(client.deserializeTokenResponse(Uint8Array.fromBase64(sigs[i])))));
+    }
+
+    const challenge = new TokenChallenge(
+        BLIND_RSA.value,
+        issuerName,
+        new Uint8Array(0), // redemption context
+        undefined,         // origin info
+    );
+
+    // The wallet keeps its tokens in localStorage, encoded as origins take
+    // them: base64url with padding, which RFC 9577 requires. A token only
+    // works with the challenge and token key it was issued for, so those are
+    // stored with the tokens, and the tokens are dropped if either changes
+    // (for example, when the issuer gets a new key). The challenge is encoded
+    // the same way, so it can be compared as is with the one an origin sends.
+    const storageKey = 'tokens';
+    const base64url = (bytes) => bytes.toBase64({ alphabet: 'base64url' });
+    const scope = {
+        challenge: base64url(challenge.serialize()),
+        tokenKey: base64url(issuerPublicKey),
+    };
+
+    function loadTokens() {
+        const saved = JSON.parse(localStorage.getItem(storageKey));
+        if (saved?.challenge !== scope.challenge || saved?.tokenKey !== scope.tokenKey) {
+            return [];
+        }
+        return saved.tokens;
+    }
+
+    function addTokens(tokens) {
+        // Read storage again right before writing, so tokens another tab
+        // stored in the meantime aren't lost.
+        const all = loadTokens().concat(tokens.map((token) => base64url(token.serialize())));
+        localStorage.setItem(storageKey, JSON.stringify({ ...scope, tokens: all }));
+    }
+
+    // takeToken removes a token from the wallet and returns it, or returns
+    // null if the wallet has none.
+    function takeToken() {
+        const tokens = loadTokens();
+        const token = tokens.shift();
+        if (token === undefined) {
+            return null;
+        }
+        localStorage.setItem(storageKey, JSON.stringify({ ...scope, tokens }));
+        return token;
+    }
+
+    const user = document.getElementById('user');
+    const login = document.getElementById('login');
+    const logout = document.getElementById('logout');
+    const count = document.getElementById('count');
+    const getTokens = document.getElementById('get');
+    const status = document.getElementById('status');
+    const consent = document.getElementById('consent');
+    const give = document.getElementById('give');
+
+    // The wallet runs in a popup when an origin's page opens it to ask for a
+    // token (see below).
+    const isPopup = window.opener !== null;
+    // In a popup, the request the user is being asked about: the origin that
+    // sent it, and a function that answers it.
+    let request = null;
+
+    // show updates the page to match the wallet's state.
+    function show() {
+        const n = loadTokens().length;
+        const s = session();
+        const loggedIn = s !== null;
+        user.hidden = !loggedIn;
+        user.textContent = loggedIn ? `Logged in as ${s.Name}` : '';
+        count.textContent = `${n} token${n === 1 ? '' : 's'} available`;
+        if (!isPopup) {
+            logout.hidden = getTokens.hidden = !loggedIn;
+            login.hidden = loggedIn;
+        } else if (request !== null) {
+            // A popup offers to log in or get tokens only when the wallet is
+            // out of them.
+            status.textContent = `${request.origin} asks for a Privacy Pass token.` +
+                (n === 0 ? ' The wallet is out of tokens.' : '');
+            login.hidden = n > 0 || loggedIn;
+            getTokens.hidden = n > 0 || !loggedIn;
+            give.hidden = n === 0;
+            consent.hidden = false;
+        }
+    }
+
+    // forgetSession drops a session the issuer no longer accepts (because it
+    // expired, say).
+    function forgetSession() {
+        console.log('Session expired; log in again');
+        localStorage.removeItem(sessionKey);
+        show();
+    }
+
+    show();
+    // Other wallet windows change the tokens and the session too.
+    addEventListener('storage', show);
+
+    login.addEventListener('click', startLogin);
+    logout.addEventListener('click', () => {
+        const { SessionID } = session();
+        localStorage.removeItem(sessionKey);
+        show();
+        fetch(issuerURL + '/logout', { method: 'POST', headers: { Authorization: `Bearer ${SessionID}` } });
+    });
+    getTokens.addEventListener('click', async () => {
+        getTokens.disabled = true;
+        try {
+            const tokens = await fetchTokens(challenge, issuerPublicKey, batchSize, session().SessionID);
+            if (tokens === null) {
+                forgetSession();
+                return;
+            }
+            addTokens(tokens);
+            console.log(`Fetched ${tokens.length} tokens`);
+            show();
+        } finally {
+            getTokens.disabled = false;
+        }
+    });
+
+    // The wallet's own page checks that the issuer still accepts the session,
+    // which it doesn't once the session expires or the issuer restarts. (A
+    // popup finds out only if the user asks it for tokens.)
+    if (!isPopup && session() !== null) {
+        const resp = await fetch(issuerURL + '/me', { headers: { Authorization: `Bearer ${session().SessionID}` } });
+        if (resp.status === 401) {
+            forgetSession();
+        }
+    }
+
+    // Giving a token to an origin: the origin's page opens the wallet in a
+    // popup through privacypass.js, which describes the messages. The wallet
+    // holds tokens only for its own challenge (this issuer, no redemption
+    // context, no origin info), so that's the only one it can answer. It asks
+    // the user before giving each token.
+    //
+    // The popup makes no requests to the issuer unless the user asks it to log
+    // in or get tokens, which it offers only when the wallet is out of them.
+    // The issuer would see who is about to use a token, and the origin would
+    // see the token used moments later, so between them they could tell who
+    // logged in. Getting tokens just before using one gives that away, so it's
+    // up to the user. Tokens aren't tied to a login, so the popup gives them
+    // whether or not the wallet is logged in.
+    if (isPopup) {
+        addEventListener('message', (e) => {
+            if (e.source !== window.opener || e.origin === 'null' || e.data?.type !== 'privacypass-request') {
+                return;
+            }
+            const reply = (msg) => e.source.postMessage(msg, e.origin);
+            if (e.data.challenge !== scope.challenge) {
+                reply({ type: 'privacypass-error', error: 'the wallet has no tokens for this challenge' });
+                return;
+            }
+            request = { origin: e.origin, reply };
+            show();
+        });
+        give.addEventListener('click', () => {
+            const token = takeToken();
+            if (token === null) {
+                show(); // another window took the last one
+                return;
+            }
+            console.log('Gave a token');
+            request.reply({ type: 'privacypass-token', token });
+            close();
+        });
+        document.getElementById('refuse').addEventListener('click', () => {
+            request.reply({ type: 'privacypass-error', error: 'the user refused to give a token' });
+            close();
+        });
+        window.opener.postMessage({ type: 'privacypass-ready' }, '*');
+    }
+    </script>
+
+    <h1>Wallet</h1>
+    <p id="user" hidden></p>
+    <button id="login" hidden>Log in</button>
+    <button id="logout" hidden>Log out</button>
+    <p><span id="count"></span> <button id="get" hidden>Get tokens</button></p>
+    <p id="status"></p>
+    <p id="consent" hidden>
+        <button id="give">Give a token</button>
+        <button id="refuse">Cancel</button>
+    </p>
+</body>
+</html>
